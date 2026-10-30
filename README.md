@@ -42,3 +42,5 @@ Only the very first time after switching to this signed build you must uninstall
 - **Less / More** button: hides the speed and extra buttons to give the map more room.
 - The chip bar at the top of the map scrolls sideways if your screen is narrow.
 - When you start a move, a message shows the route length and rough time.
+- Map tiles come from OpenStreetMap's public servers. The app identifies itself with a proper User-Agent as their policy requires, and shows the
+  "© OpenStreetMap contributors" credit on the map (tap it for the licence). Keep usage personal and light.

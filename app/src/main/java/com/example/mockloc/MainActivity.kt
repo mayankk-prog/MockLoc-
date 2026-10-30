@@ -68,6 +68,17 @@ class MainActivity : AppCompatActivity() {
     private lateinit var joystick: JoystickView
     private val prefs by lazy { getSharedPreferences("mockloc", MODE_PRIVATE) }
 
+    /** OpenStreetMap requires a specific, identifying User-Agent (generic ones like com.example.* are blocked). */
+    private val ua: String by lazy {
+        val v = try {
+            @Suppress("DEPRECATION")
+            packageManager.getPackageInfo(packageName, 0).versionName ?: "1"
+        } catch (e: Exception) {
+            "1"
+        }
+        "MockLoc-mayankk/$v (Android personal app; +https://github.com/mayankk-prog)"
+    }
+
     private var marker: Marker? = null      // the pin you tapped (destination)
     private var liveMarker: Marker? = null  // where the mock location currently is
     private var routeLine: Polyline? = null
@@ -115,10 +126,15 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
 
         val osmBase = File(cacheDir, "osmdroid")
+        // Throw away any "access blocked" tiles that were cached by earlier versions
+        if (prefs.getInt("tileCacheVer", 0) < 2) {
+            osmBase.deleteRecursively()
+            prefs.edit().putInt("tileCacheVer", 2).apply()
+        }
         val osmTiles = File(osmBase, "tiles")
         osmTiles.mkdirs()
         Configuration.getInstance().apply {
-            userAgentValue = packageName
+            userAgentValue = ua
             osmdroidBasePath = osmBase
             osmdroidTileCache = osmTiles
             tileFileSystemCacheMaxBytes = 200L * 1024 * 1024
@@ -139,6 +155,14 @@ class MainActivity : AppCompatActivity() {
         chipJoy = findViewById(R.id.chipJoy)
         chipStop = findViewById(R.id.chipStop)
         chipTimer = findViewById(R.id.chipTimer)
+        findViewById<TextView>(R.id.attribution).setOnClickListener {
+            try {
+                startActivity(
+                    Intent(Intent.ACTION_VIEW, Uri.parse("https://www.openstreetmap.org/copyright"))
+                )
+            } catch (_: Exception) {
+            }
+        }
         btnMore = findViewById(R.id.btnMore)
         extraTop = findViewById(R.id.extraTop)
         extraBottom = findViewById(R.id.extraBottom)
@@ -602,7 +626,7 @@ class MainActivity : AppCompatActivity() {
                         URLEncoder.encode(q, "UTF-8")
                 )
                 val conn = url.openConnection() as HttpURLConnection
-                conn.setRequestProperty("User-Agent", "MockLoc/1.0 (personal use)")
+                conn.setRequestProperty("User-Agent", ua)
                 conn.connectTimeout = 10000
                 conn.readTimeout = 10000
                 val body = conn.inputStream.bufferedReader().use { it.readText() }
@@ -800,7 +824,7 @@ class MainActivity : AppCompatActivity() {
             val u = "https://routing.openstreetmap.de/$profile/route/v1/driving/$coords" +
                 "?overview=full&geometries=geojson"
             val conn = URL(u).openConnection() as HttpURLConnection
-            conn.setRequestProperty("User-Agent", "MockLoc/1.0 (personal use)")
+            conn.setRequestProperty("User-Agent", ua)
             conn.connectTimeout = 12000
             conn.readTimeout = 15000
             val body = conn.inputStream.bufferedReader().use { it.readText() }

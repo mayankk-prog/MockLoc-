@@ -88,6 +88,18 @@
             </LinearLayout>
         </HorizontalScrollView>
 
+        <TextView
+            android:id="@+id/attribution"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="bottom|start"
+            android:layout_margin="4dp"
+            android:background="#B3FFFFFF"
+            android:padding="3dp"
+            android:text="© OpenStreetMap contributors"
+            android:textColor="#333333"
+            android:textSize="10sp" />
+
         <com.example.mockloc.JoystickView
             android:id="@+id/joystick"
             android:layout_width="150dp"
