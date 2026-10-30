@@ -44,3 +44,13 @@ Only the very first time after switching to this signed build you must uninstall
 - When you start a move, a message shows the route length and rough time.
 - Map tiles come from OpenStreetMap's public servers. The app identifies itself with a proper User-Agent as their policy requires, and shows the
   "© OpenStreetMap contributors" credit on the map (tap it for the licence). Keep usage personal and light.
+- Map speed: the app uses OSM's single tile host with larger tiles on sharp screens, a bigger tile cache, and keeps tiles for repeat visits.
+  The first time you view a new area it has to download; places you have already seen load instantly from the cache.
+  (OpenStreetMap does not allow pre-downloading or offline areas, so the app does not do that.)
+- The map reopens exactly where you left it (already cached, so it appears instantly), tiles are kept in a persistent 500 MB cache that Android does not clear, and a calm grey placeholder shows while new tiles arrive.
+- Searching or picking a favorite now jumps straight to the place (no zoom-then-slide), which avoids downloading tiles for places you never look at.
+- **Move to pin** can be tapped before **Start here**: it starts from the last known position and walks to the pin.
+- The marker and camera glide at about 30 frames a second, and the joystick reacts four times a second.
+
+- **Speed** now goes from 0.1 km/h to 120 km/h on a logarithmic slider (lots of precision at the slow end). The old version secretly never went below about 2.9 km/h.
+- **Arrive** chip: choose how long the trip should take (5 min ... 4 hours) and the app picks the speed for the real route length. The status line shows the real speed, distance left and ETA.

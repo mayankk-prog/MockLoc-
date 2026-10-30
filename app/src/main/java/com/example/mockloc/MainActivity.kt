@@ -7,6 +7,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.location.Location
+import android.location.LocationManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -34,7 +35,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.osmdroid.config.Configuration
 import org.osmdroid.events.MapEventsReceiver
-import org.osmdroid.tileprovider.tilesource.TileSourceFactory
+import org.osmdroid.tileprovider.tilesource.XYTileSource
 import org.osmdroid.util.GeoPoint
 import org.osmdroid.views.MapView
 import org.osmdroid.views.overlay.MapEventsOverlay
@@ -62,6 +63,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var chipJoy: Chip
     private lateinit var chipStop: Chip
     private lateinit var chipTimer: Chip
+    private lateinit var chipArrive: Chip
     private lateinit var btnMore: Button
     private lateinit var extraTop: View
     private lateinit var extraBottom: View
@@ -102,13 +104,17 @@ class MainActivity : AppCompatActivity() {
     private var pending: GeoPoint? = null
 
     private val speedIds = listOf(R.id.rbWalk, R.id.rbJog, R.id.rbBike, R.id.rbCar)
-    private val presetsKmh = listOf(5, 10, 18, 40)
+    private val presetsKmh = listOf(5f, 10f, 18f, 40f)
+    private val minKmh = 0.1f
+    private val maxKmh = 120f
+    private var speedOverride = false // true while "Arrive in N min" has set the speed
+    private var arriveMin = 0
 
     private val ui = Handler(Looper.getMainLooper())
     private val poll = object : Runnable {
         override fun run() {
             refreshLive()
-            ui.postDelayed(this, 100)
+            ui.postDelayed(this, 33)
         }
     }
 
@@ -125,11 +131,13 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        val osmBase = File(cacheDir, "osmdroid")
-        // Throw away any "access blocked" tiles that were cached by earlier versions
-        if (prefs.getInt("tileCacheVer", 0) < 2) {
+        // filesDir (not cacheDir): Android never auto-clears it, so seen tiles stay cached
+        val osmBase = File(filesDir, "osmdroid")
+        if (prefs.getInt("tileCacheVer", 0) < 4) {
+            // one-time clean start: drop tiles cached by older versions (slow hosts / blocked tiles)
+            File(cacheDir, "osmdroid").deleteRecursively()
             osmBase.deleteRecursively()
-            prefs.edit().putInt("tileCacheVer", 2).apply()
+            prefs.edit().putInt("tileCacheVer", 4).apply()
         }
         val osmTiles = File(osmBase, "tiles")
         osmTiles.mkdirs()
@@ -137,8 +145,10 @@ class MainActivity : AppCompatActivity() {
             userAgentValue = ua
             osmdroidBasePath = osmBase
             osmdroidTileCache = osmTiles
-            tileFileSystemCacheMaxBytes = 200L * 1024 * 1024
-            tileFileSystemCacheTrimBytes = 150L * 1024 * 1024
+            tileDownloadThreads = 4.toShort()
+            cacheMapTileCount = 40.toShort()
+            tileFileSystemCacheMaxBytes = 500L * 1024 * 1024
+            tileFileSystemCacheTrimBytes = 400L * 1024 * 1024
         }
 
         setContentView(R.layout.activity_main)
@@ -155,6 +165,7 @@ class MainActivity : AppCompatActivity() {
         chipJoy = findViewById(R.id.chipJoy)
         chipStop = findViewById(R.id.chipStop)
         chipTimer = findViewById(R.id.chipTimer)
+        chipArrive = findViewById(R.id.chipArrive)
         findViewById<TextView>(R.id.attribution).setOnClickListener {
             try {
                 startActivity(
@@ -168,8 +179,23 @@ class MainActivity : AppCompatActivity() {
         extraBottom = findViewById(R.id.extraBottom)
         joystick = findViewById(R.id.joystick)
 
-        map.setTileSource(TileSourceFactory.MAPNIK)
+        // OSM asks apps to use exactly https://tile.openstreetmap.org/ (single host = faster with HTTP/2;
+        // the library's default a/b/c subdomains are slower). Zoom 0..19 is what the server provides.
+        map.setTileSource(
+            XYTileSource(
+                "OsmStandard", 0, 19, 256, ".png",
+                arrayOf("https://tile.openstreetmap.org/"),
+                "© OpenStreetMap contributors"
+            )
+        )
+        // Bigger tiles on high-density screens = far fewer tiles to download for the same view
+        map.setTilesScaledToDpi(true)
+        map.setMinZoomLevel(3.0)
+        map.setMaxZoomLevel(19.0)
         map.setMultiTouchControls(true)
+        // Calm grey placeholder instead of a busy grid while tiles arrive
+        map.overlayManager.tilesOverlay.setLoadingBackgroundColor(0xFFE8E8E8.toInt())
+        map.overlayManager.tilesOverlay.setLoadingLineColor(Color.TRANSPARENT)
         // Dark map when the phone is in dark mode
         val night = resources.configuration.uiMode and
             android.content.res.Configuration.UI_MODE_NIGHT_MASK
@@ -203,26 +229,36 @@ class MainActivity : AppCompatActivity() {
             map.controller.setZoom(4.5)
             map.controller.setCenter(GeoPoint(20.5937, 78.9629))
         }
+        val vLat = prefs.getString("viewLat", null)?.toDoubleOrNull()
+        val vLon = prefs.getString("viewLon", null)?.toDoubleOrNull()
+        val vZoom = prefs.getString("viewZoom", null)?.toDoubleOrNull()
+        if (vLat != null && vLon != null && vZoom != null) {
+            map.controller.setZoom(vZoom.coerceIn(3.0, 19.0))
+            map.controller.setCenter(GeoPoint(vLat, vLon))
+        }
 
-        // Restore speed (before listeners are attached)
-        val kmh = prefs.getInt("speedKmh", 5).coerceIn(1, 120)
-        speedBar.progress = kmh - 1
+        // Restore speed (before listeners are attached). Slider is logarithmic: 0.1 .. 120 km/h
+        val kmh = prefs.getFloat("speedKmhF", prefs.getInt("speedKmh", 5).toFloat())
+            .coerceIn(minKmh, maxKmh)
+        speedBar.max = 100
+        speedBar.progress = progressFromKmh(kmh)
         applySpeed(kmh)
-        val presetIdx = presetsKmh.indexOf(kmh)
+        val presetIdx = presetsKmh.indexOfFirst { abs(it - kmh) < 0.01f }
         if (presetIdx >= 0) speedGroup.check(speedIds[presetIdx]) else speedGroup.clearCheck()
 
         speedGroup.setOnCheckedChangeListener { _, checkedId ->
             val idx = speedIds.indexOf(checkedId)
             if (idx >= 0) {
-                speedBar.progress = presetsKmh[idx] - 1
+                speedBar.progress = progressFromKmh(presetsKmh[idx])
                 applySpeed(presetsKmh[idx])
             }
         }
         speedBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
                 if (fromUser) {
-                    applySpeed(progress + 1)
-                    val idx = presetsKmh.indexOf(progress + 1)
+                    val k = kmhFromProgress(progress)
+                    applySpeed(k)
+                    val idx = presetsKmh.indexOfFirst { abs(it - k) / it < 0.04f }
                     if (idx >= 0) speedGroup.check(speedIds[idx]) else speedGroup.clearCheck()
                 }
             }
@@ -230,6 +266,22 @@ class MainActivity : AppCompatActivity() {
             override fun onStartTrackingTouch(sb: SeekBar?) {}
             override fun onStopTrackingTouch(sb: SeekBar?) {}
         })
+
+        // "Arrive in N minutes": the trip takes that long however far it is
+        arriveMin = prefs.getInt("arriveMin", 0)
+        chipArrive.text = arriveChipText()
+        chipArrive.setOnClickListener {
+            val labels = arrayOf(
+                "Auto (use the speed slider)", "5 minutes", "10 minutes", "20 minutes",
+                "30 minutes", "1 hour", "2 hours", "4 hours"
+            )
+            val mins = intArrayOf(0, 5, 10, 20, 30, 60, 120, 240)
+            AlertDialog.Builder(this)
+                .setTitle("Arrive in")
+                .setItems(labels) { _, i -> setArrive(mins[i]) }
+                .setNegativeButton("Cancel", null)
+                .show()
+        }
 
         // Loop toggle (go back and forth along the route)
         val loopOn = prefs.getBoolean("loop", false)
@@ -307,6 +359,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
         findViewById<Button>(R.id.btnStop).setOnClickListener {
+            saveView()
             startService(
                 Intent(this, MockLocationService::class.java)
                     .setAction(MockLocationService.ACTION_STOP)
@@ -322,7 +375,7 @@ class MainActivity : AppCompatActivity() {
             else selected
             if (p != null) {
                 follow = MockLocationService.running
-                map.controller.animateTo(p)
+                map.controller.setCenter(p)
             } else {
                 Toast.makeText(this, "Nothing to center on yet", Toast.LENGTH_SHORT).show()
             }
@@ -337,16 +390,76 @@ class MainActivity : AppCompatActivity() {
 
     override fun onPause() {
         ui.removeCallbacks(poll)
+        saveView()
         map.onPause()
         super.onPause()
     }
 
+    private fun saveView() {
+        try {
+            if (MockLocationService.running) {
+                prefs.edit()
+                    .putString("lastMockLat", MockLocationService.curLat.toString())
+                    .putString("lastMockLon", MockLocationService.curLon.toString())
+                    .apply()
+            }
+            val c = map.getMapCenter()
+            prefs.edit()
+                .putString("viewLat", c.latitude.toString())
+                .putString("viewLon", c.longitude.toString())
+                .putString("viewZoom", map.getZoomLevelDouble().toString())
+                .apply()
+        } catch (_: Exception) {
+        }
+    }
+
     // ---------- Speed ----------
-    private fun applySpeed(kmh: Int) {
-        val k = kmh.coerceIn(1, 120)
+    private fun kmhFromProgress(p: Int): Float =
+        (minKmh * Math.pow((maxKmh / minKmh).toDouble(), p / 100.0)).toFloat()
+
+    private fun progressFromKmh(k: Float): Int =
+        (100.0 * Math.log((k / minKmh).toDouble()) / Math.log((maxKmh / minKmh).toDouble()))
+            .toInt().coerceIn(0, 100)
+
+    private fun fmtKmh(k: Float): String = when {
+        k < 1f -> "%.2f km/h".format(k)
+        k < 10f -> "%.1f km/h".format(k)
+        else -> "%.0f km/h".format(k)
+    }
+
+    private fun fmtEta(sec: Long): String {
+        val h = sec / 3600
+        val m = (sec % 3600) / 60
+        val s = sec % 60
+        return if (h > 0) "%d:%02d:%02d".format(h, m, s) else "%d:%02d".format(m, s)
+    }
+
+    private fun fmtDuration(min: Int): String = when {
+        min < 1 -> "<1 min"
+        min < 120 -> "$min min"
+        else -> "%d h %d min".format(min / 60, min % 60)
+    }
+
+    private fun applySpeed(kmh: Float) {
+        val k = kmh.coerceIn(minKmh, maxKmh)
+        speedOverride = false
         MockLocationService.targetSpeedMs = k / 3.6f
-        speedLabel.text = "$k km/h"
-        prefs.edit().putInt("speedKmh", k).apply()
+        speedLabel.text = fmtKmh(k)
+        prefs.edit().putFloat("speedKmhF", k).apply()
+    }
+
+    private fun restoreSpeed() {
+        applySpeed(prefs.getFloat("speedKmhF", 5f))
+    }
+
+    private fun arriveChipText(): String = if (arriveMin == 0) "Arrive: auto" else
+        "Arrive: " + (if (arriveMin >= 60) "${arriveMin / 60}h" else "${arriveMin}m")
+
+    private fun setArrive(min: Int) {
+        arriveMin = min
+        prefs.edit().putInt("arriveMin", min).apply()
+        chipArrive.text = arriveChipText()
+        if (min == 0 && speedOverride) restoreSpeed()
     }
 
     // ---------- Live status / markers ----------
@@ -354,8 +467,13 @@ class MainActivity : AppCompatActivity() {
         if (status.text.toString() != t) status.text = t
     }
 
-    /** Called ~10 times a second: glides the marker between the 1 s location updates. */
+    private var frame = 0
+    private var lastTargetAt = 0L
+    private var aDur = 1000L
+
+    /** Called ~30 times a second: glides the marker (and camera) between location updates. */
     private fun refreshLive() {
+        val slow = (frame++ % 8 == 0) // text, timer and button labels only ~4 times a second
         if (MockLocationService.running) {
             val now = SystemClock.uptimeMillis()
             val cLat = MockLocationService.curLat
@@ -366,13 +484,17 @@ class MainActivity : AppCompatActivity() {
                 aLat = cLat; aLon = cLon
                 tLat = cLat; tLon = cLon
                 aStart = now
+                lastTargetAt = now
+                aDur = 1000L
                 hasDisp = true
             } else if (cLat != tLat || cLon != tLon) {
                 aLat = dLat; aLon = dLon
                 tLat = cLat; tLon = cLon
+                aDur = (now - lastTargetAt).coerceIn(120L, 1200L) // follows the real update rate
+                lastTargetAt = now
                 aStart = now
             }
-            val f = ((now - aStart) / 1000.0).coerceIn(0.0, 1.0)
+            val f = ((now - aStart).toDouble() / aDur).coerceIn(0.0, 1.0)
             val nLat = aLat + (tLat - aLat) * f
             val nLon = aLon + (tLon - aLon) * f
             val changed = nLat != dLat || nLon != dLon
@@ -405,24 +527,27 @@ class MainActivity : AppCompatActivity() {
             if (wasMoving && !moving && !joy && now > suppressArrivalUntil) {
                 Toast.makeText(this, "Arrived", Toast.LENGTH_SHORT).show()
             }
+            if (wasMoving && !moving && speedOverride) restoreSpeed()
             wasMoving = moving
             if (changed || created) map.invalidate()
 
-            setStatus(
-                when {
-                    joy -> "Joystick: %.1f km/h".format(MockLocationService.speedNow * 3.6f)
-                    moving && MockLocationService.paused ->
-                        "Paused: ${fmtDist(MockLocationService.remaining)} left"
-                    moving -> {
-                        val sec = (MockLocationService.remaining /
-                            MockLocationService.targetSpeedMs.coerceAtLeast(0.5f)).toInt()
-                        "${if (MockLocationService.loop) "Looping" else "Moving"}: " +
-                            "${fmtDist(MockLocationService.remaining)} left, ETA %d:%02d"
-                                .format(sec / 60, sec % 60)
+            if (slow) {
+                setStatus(
+                    when {
+                        joy -> "Joystick: %.1f km/h".format(MockLocationService.speedNow * 3.6f)
+                        moving && MockLocationService.paused ->
+                            "Paused: ${fmtDist(MockLocationService.remaining)} left"
+                        moving -> {
+                            val sec = (MockLocationService.remaining /
+                                MockLocationService.targetSpeedMs.coerceAtLeast(0.005f)).toLong()
+                            "${if (MockLocationService.loop) "Looping" else "Moving"} " +
+                                "${fmtKmh(MockLocationService.speedNow * 3.6f)}: " +
+                                "${fmtDist(MockLocationService.remaining)} left, ETA ${fmtEta(sec)}"
+                        }
+                        else -> "Running at %.5f, %.5f".format(nLat, nLon)
                     }
-                    else -> "Running at %.5f, %.5f".format(nLat, nLon)
-                }
-            )
+                )
+            }
         } else {
             var dirty = false
             liveMarker?.let {
@@ -437,13 +562,16 @@ class MainActivity : AppCompatActivity() {
             if (dirty) map.invalidate()
             hasDisp = false
             wasMoving = false
-            setStatus("Status: stopped")
+            if (speedOverride) restoreSpeed()
+            if (slow) setStatus("Status: stopped")
             if (chipJoy.isChecked) chipJoy.isChecked = false
         }
-        val timerText = timerChipText()
-        if (chipTimer.text.toString() != timerText) chipTimer.text = timerText
-        val pauseText = if (MockLocationService.paused) "Resume" else "Pause"
-        if (btnPause.text.toString() != pauseText) btnPause.text = pauseText
+        if (slow) {
+            val timerText = timerChipText()
+            if (chipTimer.text.toString() != timerText) chipTimer.text = timerText
+            val pauseText = if (MockLocationService.paused) "Resume" else "Pause"
+            if (btnPause.text.toString() != pauseText) btnPause.text = pauseText
+        }
     }
 
     // ---------- Timer / panel ----------
@@ -604,8 +732,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun goTo(p: GeoPoint) {
+        // Jump straight there: zooming first at the OLD spot and then sliding across the map
+        // downloads tiles for places you never look at.
+        map.controller.setCenter(p)
         map.controller.setZoom(15.0)
-        map.controller.animateTo(p)
         select(p)
     }
 
@@ -751,6 +881,27 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /** Where to begin when Move is tapped before Start: last known real/mock position, else last mock spot. */
+    @Suppress("MissingPermission")
+    private fun startPoint(): GeoPoint? {
+        if (hasFineLocation()) {
+            val lm = getSystemService(LOCATION_SERVICE) as LocationManager
+            for (name in listOf(
+                LocationManager.GPS_PROVIDER,
+                LocationManager.NETWORK_PROVIDER,
+                LocationManager.PASSIVE_PROVIDER
+            )) {
+                try {
+                    lm.getLastKnownLocation(name)?.let { return GeoPoint(it.latitude, it.longitude) }
+                } catch (_: Exception) {
+                }
+            }
+        }
+        val la = prefs.getString("lastMockLat", null)?.toDoubleOrNull()
+        val lo = prefs.getString("lastMockLon", null)?.toDoubleOrNull()
+        return if (la != null && lo != null) GeoPoint(la, lo) else null
+    }
+
     private fun onMoveClicked() {
         val dest = selected
         if (dest == null) {
@@ -758,17 +909,27 @@ class MainActivity : AppCompatActivity() {
             return
         }
         if (!MockLocationService.running) {
-            Toast.makeText(
-                this,
-                "Tap Start here first to set your starting point, then pick a new pin and tap Move",
-                Toast.LENGTH_LONG
-            ).show()
+            // Not started yet: begin at the last known position, then walk to the pin
+            val begin = startPoint()
+            if (begin == null || !hasFineLocation()) {
+                Toast.makeText(
+                    this,
+                    "Tap Start here first (it asks for location permission), then Move to pin",
+                    Toast.LENGTH_LONG
+                ).show()
+                return
+            }
+            startMock(begin.latitude, begin.longitude)
+            ui.postDelayed({ if (MockLocationService.running) onMoveClicked() }, 900)
             return
         }
         if (chipJoy.isChecked) chipJoy.isChecked = false
         val from = GeoPoint(MockLocationService.curLat, MockLocationService.curLon)
         val waypoints = listOf(from) + stops.toList() + dest
-        val kmh = prefs.getInt("speedKmh", 5)
+        // Which kind of path to ask for (footpath / bike / road) follows the speed that will be used
+        val straight = routeMeters(waypoints)
+        val kmh = if (arriveMin > 0) (straight / (arriveMin * 60.0) * 3.6).toFloat()
+        else prefs.getFloat("speedKmhF", 5f)
         Toast.makeText(this, "Finding route...", Toast.LENGTH_SHORT).show()
 
         Thread {
@@ -788,10 +949,17 @@ class MainActivity : AppCompatActivity() {
                 val full = listOf(from) + pts
                 drawRoute(full)
                 val meters = routeMeters(full)
-                val mins = (meters / MockLocationService.targetSpeedMs.coerceAtLeast(0.5f) / 60.0).toInt()
+                if (arriveMin > 0) {
+                    // speed needed to cover the real route length in exactly the chosen time
+                    val ms = (meters / (arriveMin * 60.0)).toFloat().coerceIn(0.005f, 45f)
+                    MockLocationService.targetSpeedMs = ms
+                    speedOverride = true
+                    speedLabel.text = "~" + fmtKmh(ms * 3.6f)
+                }
+                val mins = (meters / MockLocationService.targetSpeedMs.coerceAtLeast(0.005f) / 60.0).toInt()
                 Toast.makeText(
                     this,
-                    "Route ${fmtDist(meters)}, about ${if (mins < 1) "<1" else mins.toString()} min",
+                    "Route ${fmtDist(meters)}, about ${fmtDuration(mins)}",
                     Toast.LENGTH_SHORT
                 ).show()
                 val lats = DoubleArray(full.size) { full[it].latitude }
@@ -804,18 +972,19 @@ class MainActivity : AppCompatActivity() {
                 )
                 clearStops()
                 follow = true
-                map.controller.animateTo(from)
+                if (map.getZoomLevelDouble() < 14.0) map.controller.setZoom(16.0)
+                map.controller.setCenter(from)
                 ui.postDelayed({ refreshLive() }, 400)
             }
         }.start()
     }
 
     /** Road/footpath route through all points, from OpenStreetMap's free routing servers. Null on failure. */
-    private fun fetchRoute(points: List<GeoPoint>, kmh: Int): List<GeoPoint>? {
+    private fun fetchRoute(points: List<GeoPoint>, kmh: Float): List<GeoPoint>? {
         return try {
             val profile = when {
-                kmh < 8 -> "routed-foot"
-                kmh < 25 -> "routed-bike"
+                kmh < 8f -> "routed-foot"
+                kmh < 25f -> "routed-bike"
                 else -> "routed-car"
             }
             val coords = points.joinToString(";") {

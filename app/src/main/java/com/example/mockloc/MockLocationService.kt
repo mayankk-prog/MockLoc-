@@ -103,6 +103,7 @@ class MockLocationService : Service() {
 
     private var curSpeed = 0f
     private var curBearing = 0f
+    private var tickDt = 1f // seconds that passed since the previous tick
 
     private val tick = object : Runnable {
         override fun run() {
@@ -116,9 +117,12 @@ class MockLocationService : Service() {
                 shutdown()
                 return
             }
-            step()
+            step(tickDt)
             pushLocation()
-            handler.postDelayed(this, 1000)
+            // joystick updates 4x a second for a responsive feel, everything else once a second
+            val next = if (joyActive) 250L else 1000L
+            tickDt = next / 1000f
+            handler.postDelayed(this, next)
         }
     }
 
@@ -235,13 +239,13 @@ class MockLocationService : Service() {
     }
 
     /** Manual steering: stick direction = compass bearing (up = north), stick size = speed. */
-    private fun joystickStep() {
+    private fun joystickStep(dt: Float) {
         val x = joyX
         val y = joyY
         val m = minOf(1f, hypot(x.toDouble(), y.toDouble()).toFloat())
         val active = m >= 0.12f
         val target = if (active) targetSpeedMs * m else 0f
-        val delta = (target - curSpeed).coerceIn(-2.0f, 1.5f)
+        val delta = (target - curSpeed).coerceIn(-2.0f * dt, 1.5f * dt)
         curSpeed = (curSpeed + delta).coerceAtLeast(0f)
         if (curSpeed < 0.05f) curSpeed = 0f
         if (active) {
@@ -251,15 +255,15 @@ class MockLocationService : Service() {
         }
         speedNow = curSpeed
         remaining = 0.0
-        if (curSpeed > 0f) advance(Math.toRadians(curBearing.toDouble()), curSpeed.toDouble())
+        if (curSpeed > 0f) advance(Math.toRadians(curBearing.toDouble()), curSpeed.toDouble() * dt)
     }
 
     /** Advance one second along the route, with gentle acceleration and braking. */
-    private fun step() {
+    private fun step(dt: Float) {
         if (joyActive) {
             moving = false
             paused = false
-            joystickStep()
+            joystickStep(dt)
             return
         }
         if (!moving) return
@@ -272,11 +276,12 @@ class MockLocationService : Service() {
         val left = remainingDistance()
         var target = targetSpeedMs
         if (left <= curSpeed * curSpeed / 3.0) target = minOf(target, 1.0f)
-        val delta = (target - curSpeed).coerceIn(-1.5f, 1.2f)
-        curSpeed = (curSpeed + delta).coerceAtLeast(0.8f)
+        val delta = (target - curSpeed).coerceIn(-1.5f * dt, 1.2f * dt)
+        // never faster than asked: the old fixed 0.8 m/s floor made 1 km/h behave like ~2.9 km/h
+        curSpeed = (curSpeed + delta).coerceAtLeast(minOf(0.8f, targetSpeedMs))
         speedNow = curSpeed
 
-        var budget = curSpeed.toDouble()
+        var budget = curSpeed.toDouble() * dt
         val res = FloatArray(2)
         while (budget > 0.0 && wpIdx < wpLat.size) {
             Location.distanceBetween(curLat, curLon, wpLat[wpIdx], wpLon[wpIdx], res)

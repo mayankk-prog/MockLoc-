@@ -79,6 +79,14 @@
                     android:text="Add stop" />
 
                 <com.google.android.material.chip.Chip
+                    android:id="@+id/chipArrive"
+                    style="@style/Widget.Material3.Chip.Assist"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:text="Arrive: auto" />
+
+                <com.google.android.material.chip.Chip
                     android:id="@+id/chipTimer"
                     style="@style/Widget.Material3.Chip.Assist"
                     android:layout_width="wrap_content"
